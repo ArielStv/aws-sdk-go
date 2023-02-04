@@ -37,7 +37,6 @@ func S3ManagerUploadInputGoCode(a *API) string {
 var s3managerUploadInputTmpl = template.Must(
 	template.New("s3managerUploadInputTmpl").
 		Funcs(template.FuncMap{
-			"GetDeprecatedMsg": getDeprecatedMessage,
 			"GetDocstring": func(parent *Shape, memberName string, ref *ShapeRef) string {
 				doc := ref.Docstring()
 				if ref.Deprecated {
@@ -101,5 +100,19 @@ type UploadInput struct {
 			{{ $name }} {{ $.GoStructType $name $ref }} {{ $ref.GoTags false $isRequired }}
 		{{ end }}
 	{{ end }}
+
+	// If UploadID is passed, s3manager will attempt to resume a previously-interrupted
+	// upload. ListParts is called to retrieve uploaded chunks, which are later checked
+	// against the input data to guarantee data consistency.
+	// The data consistency check compares the CRC32 checksum of input chunks vs
+	// uploaded chunks. If s3manager detects data inconcistency, it will fail the upload.
+	// This can happen if the input data has been modifed since the last upload,
+	// or the part size parameter was changed, for example.
+	UploadID *string
+
+	// Optional callback function to allow the client to retrieve the upload ID of the
+	// initiated multipart upload. This is useful in cases where the upload process
+	// gets interrupted before s3manager can fail the upload.
+	UploadIDHandler func(uploadID string)
 }
 `

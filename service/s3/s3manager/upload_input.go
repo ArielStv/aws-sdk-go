@@ -259,4 +259,18 @@ type UploadInput struct {
 	// on Amazon S3 (https://docs.aws.amazon.com/AmazonS3/latest/dev/WebsiteHosting.html)
 	// and How to Configure Website Page Redirects (https://docs.aws.amazon.com/AmazonS3/latest/dev/how-to-page-redirect.html).
 	WebsiteRedirectLocation *string `location:"header" locationName:"x-amz-website-redirect-location" type:"string"`
+
+	// If UploadID is passed, s3manager will attempt to resume a previously-interrupted
+	// upload. ListParts is called to retrieve uploaded chunks, which are later checked
+	// against the input data to guarantee data consistency.
+	// The data consistency check compares the CRC32 checksum of input chunks vs
+	// uploaded chunks. If s3manager detects data inconcistency, it will fail the upload.
+	// This can happen if the input data has been modifed since the last upload,
+	// or the part size parameter was changed, for example.
+	UploadID *string
+
+	// Optional callback function to allow the client to retrieve the upload ID of the
+	// initiated multipart upload. This is useful in cases where the upload process
+	// gets interrupted before s3manager can fail the upload.
+	UploadIDHandler func(uploadID string)
 }

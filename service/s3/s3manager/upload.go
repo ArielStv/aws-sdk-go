@@ -1,8 +1,13 @@
 package s3manager
 
+// This is a fork of github.com/aws/aws-sdk-go/service/s3/s3manager/upload.go v1.44.170.
+
 import (
 	"bytes"
+	"encoding/base64"
+	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"sort"
 	"sync"
@@ -66,7 +71,7 @@ type awsError awserr.Error
 // Composed of BaseError for code, message, and original error
 //
 // Should be used for an error that occurred failing a S3 multipart upload,
-// and a upload ID is available. If an uploadID is not available a more relevant
+// and a upload ID is available. If an uploadID is not available a more relevant.
 type multiUploadError struct {
 	awsError
 
@@ -557,6 +562,7 @@ type multiuploader struct {
 	err      error
 	uploadID string
 	parts    completedParts
+	inParts  map[int64]string
 }
 
 // keeps track of a single chunk of data being sent to S3.
@@ -564,6 +570,20 @@ type chunk struct {
 	buf     io.ReadSeeker
 	num     int64
 	cleanup func()
+}
+
+func (c chunk) crc32() (string, error) {
+	hash := crc32.NewIEEE()
+	// Copy chunk data.
+	if _, err := io.Copy(hash, c.buf); err != nil {
+		return "", err
+	}
+	checksum := base64.StdEncoding.EncodeToString(hash.Sum(nil)[:])
+	// Reset reader.
+	if _, err := c.buf.Seek(0, 0); err != nil {
+		return "", err
+	}
+	return checksum, nil
 }
 
 // completedParts is a wrapper to make parts sortable by their part number,
@@ -577,16 +597,31 @@ func (a completedParts) Less(i, j int) bool { return *a[i].PartNumber < *a[j].Pa
 // upload will perform a multipart upload using the firstBuf buffer containing
 // the first chunk of data.
 func (u *multiuploader) upload(firstBuf io.ReadSeeker, cleanup func()) (*UploadOutput, error) {
-	params := &s3.CreateMultipartUploadInput{}
-	awsutil.Copy(params, u.in)
-
-	// Create the multipart
-	resp, err := u.cfg.S3.CreateMultipartUploadWithContext(u.ctx, params, u.cfg.RequestOptions...)
-	if err != nil {
-		cleanup()
-		return nil, err
+	if uploadID := u.in.UploadID; uploadID != nil {
+		// use provided upload ID if any (resume upload)
+		parts, err := u.resume(*uploadID)
+		if err != nil {
+			cleanup()
+			return nil, err
+		}
+		// Successfully retrieved previously-uploaded parts.
+		u.uploadID = *uploadID
+		u.parts = parts
 	}
-	u.uploadID = *resp.UploadId
+	if u.uploadID == "" {
+		// Create the multipart upload.
+		params := &s3.CreateMultipartUploadInput{}
+		awsutil.Copy(params, u.in)
+		params.ChecksumAlgorithm = aws.String("CRC32")
+		resp, err := u.cfg.S3.CreateMultipartUploadWithContext(u.ctx, params, u.cfg.RequestOptions...)
+		if err != nil {
+			cleanup()
+			return nil, err
+		}
+		u.uploadID = *resp.UploadId
+		// Send new upload ID to client for book-keeping.
+		u.handleUploadID(u.uploadID)
+	}
 
 	// Create the workers
 	ch := make(chan chunk, u.cfg.Concurrency)
@@ -600,6 +635,7 @@ func (u *multiuploader) upload(firstBuf io.ReadSeeker, cleanup func()) (*UploadO
 	ch <- chunk{buf: firstBuf, num: num, cleanup: cleanup}
 
 	// Read and queue the rest of the parts
+	var err error
 	for u.geterr() == nil && err == nil {
 		var (
 			reader       io.ReadSeeker
@@ -628,6 +664,9 @@ func (u *multiuploader) upload(firstBuf io.ReadSeeker, cleanup func()) (*UploadO
 	complete := u.complete()
 
 	if err := u.geterr(); err != nil {
+		if awsErr, ok := err.(awserr.Error); ok {
+			return nil, awsErr
+		}
 		return nil, &multiUploadError{
 			awsError: awserr.New(
 				"MultipartUpload",
@@ -708,6 +747,29 @@ func (u *multiuploader) readChunk(ch chan chunk) {
 // send performs an UploadPart request and keeps track of the completed
 // part information.
 func (u *multiuploader) send(c chunk) error {
+	// Compute part's CRC32 hash.
+	// We always compute the checksum:
+	//  - if the part was already uploaded, it is used for data consistency check
+	//  - otherwise, it is attached to the upload request, for S3 to store and perform a data integrity check.
+	checksum, err := c.crc32()
+	if err != nil {
+		return err
+	}
+
+	// Check if part was already uploaded.
+	// u.inParts is sharded by part number, and read-only after initialization,
+	// so concurrent reads are okay.
+	if check, ok := u.inParts[c.num]; ok {
+		if check != checksum {
+			// This should not happen unless:
+			//  - the data changed since the last upload
+			//  - the requested part size changed since the last upload.
+			// In both cases, we should restart the upload from scratch.
+			return errors.New("part checksum inconsistency")
+		}
+		return nil
+	}
+
 	params := &s3.UploadPartInput{
 		Bucket:               u.in.Bucket,
 		Key:                  u.in.Key,
@@ -716,6 +778,8 @@ func (u *multiuploader) send(c chunk) error {
 		SSECustomerAlgorithm: u.in.SSECustomerAlgorithm,
 		SSECustomerKey:       u.in.SSECustomerKey,
 		PartNumber:           &c.num,
+		ChecksumAlgorithm:    aws.String("CRC32"),
+		ChecksumCRC32:        &checksum,
 	}
 
 	resp, err := u.cfg.S3.UploadPartWithContext(u.ctx, params, u.cfg.RequestOptions...)
@@ -724,7 +788,7 @@ func (u *multiuploader) send(c chunk) error {
 	}
 
 	n := c.num
-	completed := &s3.CompletedPart{ETag: resp.ETag, PartNumber: &n}
+	completed := &s3.CompletedPart{ETag: resp.ETag, PartNumber: &n, ChecksumCRC32: resp.ChecksumCRC32}
 
 	u.m.Lock()
 	u.parts = append(u.parts, completed)
@@ -764,6 +828,8 @@ func (u *multiuploader) fail() {
 	if err != nil {
 		logMessage(u.cfg.S3, aws.LogDebug, fmt.Sprintf("failed to abort multipart upload, %v", err))
 	}
+	// Void the upload ID client-side.
+	u.handleUploadID("")
 }
 
 // complete successfully completes a multipart upload and returns the response.
@@ -789,6 +855,38 @@ func (u *multiuploader) complete() *s3.CompleteMultipartUploadOutput {
 	}
 
 	return resp
+}
+
+func (u *multiuploader) resume(uploadID string) ([]*s3.CompletedPart, error) {
+	params := &s3.ListPartsInput{
+		Bucket:   u.in.Bucket,
+		Key:      u.in.Key,
+		UploadId: &uploadID,
+	}
+	parts, err := u.cfg.S3.ListPartsWithContext(u.ctx, params, u.cfg.RequestOptions...)
+	if err != nil {
+		return nil, err
+	}
+	// Populate completed parts and the inParts map.
+	// The inParts map will be used for thread-safe check of previously-uploaded parts.
+	completedParts := make([]*s3.CompletedPart, len(parts.Parts))
+	u.inParts = make(map[int64]string)
+	for i, part := range parts.Parts {
+		completedParts[i] = &s3.CompletedPart{
+			PartNumber:    part.PartNumber,
+			ETag:          part.ETag,
+			ChecksumCRC32: part.ChecksumCRC32,
+		}
+		u.inParts[*part.PartNumber] = *part.ChecksumCRC32
+	}
+	return completedParts, nil
+}
+
+func (u *multiuploader) handleUploadID(uploadID string) {
+	if u.in.UploadIDHandler == nil {
+		return
+	}
+	u.in.UploadIDHandler(uploadID)
 }
 
 type readerAtSeeker interface {

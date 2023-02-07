@@ -599,6 +599,7 @@ func (a completedParts) Less(i, j int) bool { return *a[i].PartNumber < *a[j].Pa
 func (u *multiuploader) upload(firstBuf io.ReadSeeker, cleanup func()) (*UploadOutput, error) {
 	if uploadID := u.in.UploadID; uploadID != nil {
 		// use provided upload ID if any (resume upload)
+		logMessage(u.cfg.S3, aws.LogDebug, fmt.Sprintf("resuming upload using upload ID %s", *uploadID))
 		parts, err := u.resume(*uploadID)
 		if err != nil {
 			cleanup()
@@ -767,6 +768,7 @@ func (u *multiuploader) send(c chunk) error {
 			// In both cases, we should restart the upload from scratch.
 			return errors.New("part checksum inconsistency")
 		}
+		logMessage(u.cfg.S3, aws.LogDebug, fmt.Sprintf("skipping uploaded part: %d", c.num))
 		return nil
 	}
 
